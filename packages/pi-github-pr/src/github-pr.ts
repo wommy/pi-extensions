@@ -136,7 +136,10 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
 	};
 	const schedulePeriodicRefresh = (ctx: ExtensionContext, session: number) => {
 		const sessionManager = readSessionManager(ctx);
-		if (sessionManager === STALE_CONTEXT) return;
+		if (sessionManager === STALE_CONTEXT) {
+			retireStaleBranchWatch(session);
+			return;
+		}
 		cancelRefresh(branchWatch);
 		const generation = branchWatch.generation;
 		branchWatch.refreshTimer = setTimeout(async () => {
@@ -152,7 +155,10 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
 	};
 	const scheduleBranchRefresh = (ctx: ExtensionContext, session: number) => {
 		const sessionManager = readSessionManager(ctx);
-		if (sessionManager === STALE_CONTEXT) return;
+		if (sessionManager === STALE_CONTEXT) {
+			retireStaleBranchWatch(session);
+			return;
+		}
 		cancelInitialization(branchWatch);
 		branchWatch.generation += 1;
 		const generation = branchWatch.generation;
@@ -179,6 +185,14 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
 		clearExpiryTimer(branchWatch);
 		branchWatch.watcher?.close();
 		branchWatch.watcher = undefined;
+	};
+	// A reload strands the watcher: the previous ctx goes stale without a session_shutdown, so the
+	// callback keeps firing on every HEAD change for the life of the process. Only retire it while
+	// this dead session still holds the slot; once a live session has claimed it the watcher is
+	// theirs.
+	const retireStaleBranchWatch = (session: number) => {
+		if (session !== branchWatch.session) return;
+		closeBranchWatcher();
 	};
 	const initializeSession = async (
 		ctx: ExtensionContext,
