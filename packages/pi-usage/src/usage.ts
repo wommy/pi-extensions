@@ -62,6 +62,7 @@ const ALL_PROVIDER_CONCURRENCY = 2;
 const FAILURE_BACKOFF_MS = 30_000;
 const MAX_ACCOUNT_STATES = 32;
 const STATUS_KEY = "usage";
+const STALE_CONTEXT = Symbol("stale extension context");
 
 const REFRESH_CURRENT = "Refresh current usage";
 const VIEW_ANOTHER = "View another configured provider…";
@@ -130,6 +131,15 @@ export default function usageExtension(
 			return true;
 		} catch (error) {
 			if (isStaleExtensionContextError(error)) return false;
+			throw error;
+		}
+	};
+
+	const readCurrentModel = (ctx: ExtensionContext): PiModel | undefined | typeof STALE_CONTEXT => {
+		try {
+			return ctx.model;
+		} catch (error) {
+			if (isStaleExtensionContextError(error)) return STALE_CONTEXT;
 			throw error;
 		}
 	};
@@ -207,10 +217,11 @@ export default function usageExtension(
 			const generation = statusGeneration;
 			statusCountdownTimer = setTimeout(() => {
 				statusCountdownTimer = undefined;
+				if (!sessionActive || generation !== statusGeneration) return;
+				const currentModel = readCurrentModel(ctx);
 				if (
-					!sessionActive ||
-					generation !== statusGeneration ||
-					modelIdentity(ctx.model) !== modelIdentity(model)
+					currentModel === STALE_CONTEXT ||
+					modelIdentity(currentModel) !== modelIdentity(model)
 				) {
 					return;
 				}
@@ -502,7 +513,7 @@ export default function usageExtension(
 			if (!sessionActive || generation !== statusGeneration || controller.signal.aborted) return;
 			if (!(await outcomeStillCurrent(ctx, model, generation, outcome, controller.signal))) {
 				if (sessionActive && generation === statusGeneration) {
-					queueMicrotask(() => startStatusRefresh(ctx, ctx.model, false));
+					queueMicrotask(() => refreshCurrentModelStatus(ctx));
 				}
 				return;
 			}
@@ -522,6 +533,12 @@ export default function usageExtension(
 			if (isStaleExtensionContextError(error) || isAbortError(error)) return;
 			safeSetStatus(ctx, "usage error");
 		});
+	};
+
+	const refreshCurrentModelStatus = (ctx: ExtensionContext) => {
+		const model = readCurrentModel(ctx);
+		if (model === STALE_CONTEXT) return;
+		startStatusRefresh(ctx, model, false);
 	};
 
 	const runMenuOperation = async <T>(
@@ -1149,13 +1166,13 @@ export default function usageExtension(
 		}
 	});
 	pi.on("session_tree", (_event, ctx) => {
-		startStatusRefresh(ctx, ctx.model, false);
+		refreshCurrentModelStatus(ctx);
 	});
 	pi.on("model_select", (event, ctx) => {
 		startStatusRefresh(ctx, event.model, false);
 	});
 	pi.on("turn_start", (_event, ctx) => {
-		startStatusRefresh(ctx, ctx.model, false);
+		refreshCurrentModelStatus(ctx);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		sessionActive = false;
@@ -1175,7 +1192,7 @@ export default function usageExtension(
 	fastRuntime = registerCodexFastMode(
 		pi,
 		settingsRuntime,
-		(ctx) => startStatusRefresh(ctx, ctx.model, false),
+		(ctx) => refreshCurrentModelStatus(ctx),
 		{ registerSessionStart: false },
 	);
 }
