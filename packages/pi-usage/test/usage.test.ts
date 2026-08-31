@@ -129,6 +129,17 @@ function memorySettingsRuntime(
 	return { runtime, state: () => structuredClone(state) };
 }
 
+function staleContext(ctx: Record<string, unknown>): void {
+	const stale = () => {
+		throw new Error(
+			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+		);
+	};
+	Object.defineProperty(ctx, "model", { configurable: true, get: stale });
+	Object.defineProperty(ctx, "sessionManager", { configurable: true, get: stale });
+	(ctx.ui as Record<string, unknown>).setStatus = stale;
+}
+
 async function settle(): Promise<void> {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1584,6 +1595,58 @@ test("Codex reset countdown repaints locally and stops across replacement and sh
 	await vi.advanceTimersByTimeAsync(60_000);
 	assert.equal(statuses.get("usage"), undefined);
 	assert.equal(fetches, 2);
+});
+
+test("a stale extension context stops the countdown timer instead of crashing Pi", async (t) => {
+	const originalFetch = globalThis.fetch;
+	vi.useFakeTimers();
+	t.onTestFinished(() => {
+		globalThis.fetch = originalFetch;
+		vi.useRealTimers();
+	});
+	const now = Date.parse("2026-08-29T00:00:00Z");
+	vi.setSystemTime(now);
+	globalThis.fetch = async () =>
+		new Response(
+			JSON.stringify({
+				rate_limit: {
+					primary_window: {
+						used_percent: 20,
+						limit_window_seconds: 18_000,
+						reset_at: (now + 150_000) / 1_000,
+					},
+				},
+			}),
+			{ status: 200 },
+		);
+	const settings = memorySettingsRuntime({ codexStatusResetCountdown: true });
+	const mock = createMockPi();
+	usageExtension(mock.pi, { settingsRuntime: settings.runtime });
+	const { ctx, statuses } = createMockContext({
+		model: codexModel,
+		modelRegistry: {
+			getProviderAuth: async () => ({ auth: { apiKey: codexToken } }),
+			getAvailable: () => [codexModel],
+			getAll: () => [codexModel],
+			getProviderAuthStatus: () => ({ configured: true }),
+			getProviderDisplayName: (provider: string) => provider,
+		},
+	});
+
+	await mock.events.get("session_start")?.[0]?.({}, ctx);
+	await vi.advanceTimersByTimeAsync(0);
+	assert.equal(statuses.get("usage"), "codex 80% ↻ 3m");
+
+	staleContext(ctx);
+	await vi.advanceTimersByTimeAsync(60_000);
+	assert.equal(statuses.get("usage"), "codex 80% ↻ 3m");
+
+	await vi.advanceTimersByTimeAsync(5 * 60_000);
+	assert.equal(statuses.get("usage"), "codex 80% ↻ 3m");
+
+	mock.events.get("turn_start")?.[0]?.({}, ctx);
+	await vi.advanceTimersByTimeAsync(0);
+	assert.equal(statuses.get("usage"), "codex 80% ↻ 3m");
 });
 
 test("a slow command cannot overwrite status after the selected model changes", async (t) => {

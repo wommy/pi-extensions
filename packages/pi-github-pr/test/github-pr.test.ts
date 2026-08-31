@@ -1376,6 +1376,108 @@ test("ambient failures stay non-intrusive", async () => {
 	}
 });
 
+test("a stale extension context stops the expiry timer instead of crashing pi", async () => {
+	const mock = createMockPi();
+	const mergedAt = new Date(Date.now() - 24 * 60 * 60 * 1000 + 300).toISOString();
+	installExec(mock, async (_command, args) =>
+		okResult(args[0] === "pr" ? { ...samplePr, state: "MERGED", mergedAt } : sampleCounts),
+	);
+	githubPr(mock.pi);
+	const context = createMockContext({ cwd: "/repo" });
+	const sessionStart = mock.events.get("session_start")?.[0];
+	assert.ok(sessionStart);
+
+	const uncaught: unknown[] = [];
+	const recordUncaught = (error: unknown) => uncaught.push(error);
+	const existingHandlers = process.listeners("uncaughtException");
+	process.removeAllListeners("uncaughtException");
+	process.on("uncaughtException", recordUncaught);
+	try {
+		await sessionStart({}, context.ctx);
+		await waitFor(
+			() => (context.statuses.get("github-pr") ?? "").endsWith(": merged"),
+			"recent terminal PR status is visible",
+		);
+
+		staleContext(context.ctx as unknown as Record<string, unknown>);
+		await wait(600);
+	} finally {
+		process.off("uncaughtException", recordUncaught);
+		for (const handler of existingHandlers) process.on("uncaughtException", handler);
+	}
+
+	assert.deepEqual(uncaught, []);
+	assert.match(context.statuses.get("github-pr") ?? "", /: merged$/);
+});
+
+test("a stale extension context retires the branch watcher instead of waking forever", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-github-pr-test-"));
+	const gitDir = join(root, ".git");
+	const headPath = join(gitDir, "HEAD");
+	mkdirSync(gitDir);
+	writeFileSync(headPath, "ref: refs/heads/feature\n");
+
+	let ghPrViews = 0;
+	const mock = createMockPi();
+	installExec(mock, async (command, args) => {
+		if (command === "git") return textResult(".git/HEAD\n");
+		if (args[0] === "pr") {
+			ghPrViews += 1;
+			return okResult(samplePr);
+		}
+		return okResult(sampleCounts);
+	});
+	githubPr(mock.pi);
+	const context = createMockContext({ cwd: root });
+	const sessionStart = mock.events.get("session_start")?.[0];
+	assert.ok(sessionStart);
+
+	let staleReads = 0;
+	let readsAfterRetirement = 0;
+	const uncaught: unknown[] = [];
+	const recordUncaught = (error: unknown) => uncaught.push(error);
+	const existingHandlers = process.listeners("uncaughtException");
+	process.removeAllListeners("uncaughtException");
+	process.on("uncaughtException", recordUncaught);
+	try {
+		await sessionStart({}, context.ctx);
+		await waitFor(() => ghPrViews === 1, "initial refresh runs while the ctx is live");
+
+		staleContext(context.ctx as unknown as Record<string, unknown>, () => {
+			staleReads += 1;
+		});
+
+		writeFileSync(headPath, "ref: refs/heads/main\n");
+		await waitFor(() => staleReads > 0, "the stale ctx is observed on the first HEAD change");
+		await wait(200);
+		readsAfterRetirement = staleReads;
+
+		writeFileSync(headPath, "ref: refs/heads/other\n");
+		await wait(200);
+		writeFileSync(headPath, "ref: refs/heads/third\n");
+		await wait(200);
+	} finally {
+		process.off("uncaughtException", recordUncaught);
+		for (const handler of existingHandlers) process.on("uncaughtException", handler);
+	}
+
+	assert.deepEqual(uncaught, []);
+	assert.equal(staleReads, readsAfterRetirement);
+	assert.equal(ghPrViews, 1);
+});
+
+function staleContext(ctx: Record<string, unknown>, onRead?: () => void): void {
+	const stale = () => {
+		onRead?.();
+		throw new Error(
+			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+		);
+	};
+	Object.defineProperty(ctx, "sessionManager", { configurable: true, get: stale });
+	Object.defineProperty(ctx, "cwd", { configurable: true, get: stale });
+	(ctx.ui as Record<string, unknown>).setStatus = stale;
+}
+
 async function lifecycleStatusFor(exec: ExecFunction) {
 	const mock = createMockPi();
 	installExec(mock, exec);
