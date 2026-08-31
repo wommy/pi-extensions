@@ -32,21 +32,24 @@ function processExists(pid: number): boolean {
 	} catch {
 		return false;
 	}
-	return !isZombieProcess(pid);
+	return isProcessAlive(pid);
 }
 
 // A killed process stays in the process table as a zombie until its parent reaps it, and
 // process.kill(pid, 0) keeps succeeding for that dead entry. Descendants here outlive their
 // spawning parent, so wherever orphans are not reparented and reaped promptly the entry lingers
-// and a liveness check built on kill(pid, 0) alone never observes the kill.
-function isZombieProcess(pid: number): boolean {
-	if (process.platform !== "linux") return false;
+// and a liveness check built on kill(pid, 0) alone never observes the kill. The entry can also be
+// reaped out from under this very read, so a missing /proc/<pid>/stat (ENOENT) means the process
+// is gone, not merely unreadable.
+function isProcessAlive(pid: number): boolean {
+	if (process.platform !== "linux") return true;
 	try {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
 		const afterComm = stat.slice(stat.lastIndexOf(") ") + 2);
-		return afterComm.startsWith("Z");
-	} catch {
-		return false;
+		return !afterComm.startsWith("Z");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		return true;
 	}
 }
 
