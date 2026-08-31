@@ -43,6 +43,7 @@ export interface PullRequestStatus {
 }
 
 const STATUS_KEY = "github-pr";
+const STALE_CONTEXT = Symbol("stale extension context");
 const GH_TIMEOUT_MS = 10_000;
 const GIT_TIMEOUT_MS = 5_000;
 const BRANCH_REFRESH_DEBOUNCE_MS = 100;
@@ -115,8 +116,9 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
 		generation: number,
 		controller: AbortController,
 	): Promise<boolean> => {
-		const sessionManager = ctx.sessionManager;
 		try {
+			const sessionManager = readSessionManager(ctx);
+			if (sessionManager === STALE_CONTEXT) return false;
 			const request = await refreshStatus(ctx, controller.signal, generation);
 			return (
 				!controller.signal.aborted &&
@@ -133,9 +135,10 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
 		}
 	};
 	const schedulePeriodicRefresh = (ctx: ExtensionContext, session: number) => {
+		const sessionManager = readSessionManager(ctx);
+		if (sessionManager === STALE_CONTEXT) return;
 		cancelRefresh(branchWatch);
 		const generation = branchWatch.generation;
-		const sessionManager = ctx.sessionManager;
 		branchWatch.refreshTimer = setTimeout(async () => {
 			branchWatch.refreshTimer = undefined;
 			if (!ownsSession(session, sessionManager) || generation !== branchWatch.generation) return;
@@ -148,10 +151,11 @@ export default function githubPr(pi: ExtensionAPI, options: GithubPrOptions = {}
 		branchWatch.refreshTimer.unref?.();
 	};
 	const scheduleBranchRefresh = (ctx: ExtensionContext, session: number) => {
+		const sessionManager = readSessionManager(ctx);
+		if (sessionManager === STALE_CONTEXT) return;
 		cancelInitialization(branchWatch);
 		branchWatch.generation += 1;
 		const generation = branchWatch.generation;
-		const sessionManager = ctx.sessionManager;
 		cancelRefresh(branchWatch);
 		clearExpiryTimer(branchWatch);
 		clearStatus(ctx);
@@ -522,7 +526,7 @@ function renderStatus(
 		return;
 	}
 
-	ctx.ui.setStatus(STATUS_KEY, formatLinkedStatus(status));
+	setStatus(ctx, formatLinkedStatus(status));
 	if (expiresAt === undefined) return;
 	branchWatch.expiryTimer = setTimeout(() => {
 		branchWatch.expiryTimer = undefined;
@@ -608,8 +612,38 @@ function osc8Link(url: string, text: string): string {
 	}
 }
 
+function isStaleExtensionContextError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		error.message.includes("This extension ctx is stale after session replacement or reload")
+	);
+}
+
+// A captured ctx goes stale after session replacement or reload, and every accessor on it then
+// throws. Delayed callbacks (timers, watchers) hold such a ctx, so reading or writing through it
+// has to tolerate the stale case instead of crashing the agent with an uncaught exception.
+function readSessionManager(
+	ctx: ExtensionContext,
+): ExtensionContext["sessionManager"] | typeof STALE_CONTEXT {
+	try {
+		return ctx.sessionManager;
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return STALE_CONTEXT;
+		throw error;
+	}
+}
+
+function setStatus(ctx: ExtensionContext, status: string | undefined) {
+	try {
+		ctx.ui.setStatus(STATUS_KEY, status);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return;
+		throw error;
+	}
+}
+
 function clearStatus(ctx: ExtensionContext) {
-	ctx.ui.setStatus(STATUS_KEY, undefined);
+	setStatus(ctx, undefined);
 }
 
 function renderAmbientFailure(ctx: ExtensionContext, error: unknown) {
@@ -617,11 +651,11 @@ function renderAmbientFailure(ctx: ExtensionContext, error: unknown) {
 	const lower = message.toLowerCase();
 
 	if (isGhExecutableMissingMessage(lower)) {
-		ctx.ui.setStatus(STATUS_KEY, "PR gh missing");
+		setStatus(ctx, "PR gh missing");
 		return;
 	}
 	if (/not authenticated|auth login|authentication/.test(lower)) {
-		ctx.ui.setStatus(STATUS_KEY, "PR gh auth");
+		setStatus(ctx, "PR gh auth");
 		return;
 	}
 

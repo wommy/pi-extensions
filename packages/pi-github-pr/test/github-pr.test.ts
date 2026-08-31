@@ -1376,6 +1376,51 @@ test("ambient failures stay non-intrusive", async () => {
 	}
 });
 
+test("a stale extension context stops the expiry timer instead of crashing pi", async () => {
+	const mock = createMockPi();
+	const mergedAt = new Date(Date.now() - 24 * 60 * 60 * 1000 + 300).toISOString();
+	installExec(mock, async (_command, args) =>
+		okResult(args[0] === "pr" ? { ...samplePr, state: "MERGED", mergedAt } : sampleCounts),
+	);
+	githubPr(mock.pi);
+	const context = createMockContext({ cwd: "/repo" });
+	const sessionStart = mock.events.get("session_start")?.[0];
+	assert.ok(sessionStart);
+
+	const uncaught: unknown[] = [];
+	const recordUncaught = (error: unknown) => uncaught.push(error);
+	const existingHandlers = process.listeners("uncaughtException");
+	process.removeAllListeners("uncaughtException");
+	process.on("uncaughtException", recordUncaught);
+	try {
+		await sessionStart({}, context.ctx);
+		await waitFor(
+			() => (context.statuses.get("github-pr") ?? "").endsWith(": merged"),
+			"recent terminal PR status is visible",
+		);
+
+		staleContext(context.ctx as unknown as Record<string, unknown>);
+		await wait(600);
+	} finally {
+		process.off("uncaughtException", recordUncaught);
+		for (const handler of existingHandlers) process.on("uncaughtException", handler);
+	}
+
+	assert.deepEqual(uncaught, []);
+	assert.match(context.statuses.get("github-pr") ?? "", /: merged$/);
+});
+
+function staleContext(ctx: Record<string, unknown>): void {
+	const stale = () => {
+		throw new Error(
+			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+		);
+	};
+	Object.defineProperty(ctx, "sessionManager", { configurable: true, get: stale });
+	Object.defineProperty(ctx, "cwd", { configurable: true, get: stale });
+	(ctx.ui as Record<string, unknown>).setStatus = stale;
+}
+
 async function lifecycleStatusFor(exec: ExecFunction) {
 	const mock = createMockPi();
 	installExec(mock, exec);
